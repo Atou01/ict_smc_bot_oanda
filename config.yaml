@@ -1,0 +1,25 @@
+IBKR:
+  host: 127.0.0.1
+  port: 7497
+  clientId: 1
+  account: U1234567
+  symbols:
+    - EURUSD
+    - USDJPY
+TIMEFRAMES:
+  analysis: "H1"
+  exec: "1 min"
+LIVE: true
+MAX_DRAWDOWN: 5  # % max drawdown before halting live trading
+MAX_SLIPPAGE: 2  # max slippage in pips for live orders
+  - "EUR_USD"
+  - "GBP_USD"
+  - "USD_JPY"
+TIMEFRAMES:
+  analysis: "H1"
+  exec: "M15"
+RISK:
+  risk_per_trade: 1  # % du capital par trade
+CALENDAR:
+  source: "forexfactory"
+  timezone: "UTC"

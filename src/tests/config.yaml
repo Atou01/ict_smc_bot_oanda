@@ -1,0 +1,4 @@
+OPENAI:
+  api_key: "sk-..."
+ENAI:
+  api_key: "test"

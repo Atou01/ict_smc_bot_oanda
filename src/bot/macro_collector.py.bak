@@ -1,0 +1,805 @@
+"""
+macro_collector.py
+Module de collecte des données macroéconomiques via le calendrier économique XML.
+Récupère les événements économiques, les analyse et les met à disposition du LLM.
+"""
+
+import os
+import json
+import time
+import logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from threading import Thread, Event
+import requests
+from collections import deque
+import random
+from pathlib import Path
+from typing import Optional
+import pytz
+
+# Définition du fuseau horaire local à utiliser pour toutes les conversions
+LOCAL_TZ = pytz.timezone('Europe/Paris')
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('MacroCollector')
+
+# Définition d'une exception personnalisée pour les erreurs de limite de débit
+class RateLimitError(Exception):
+    """Exception levée quand on rencontre une erreur 429 Too Many Requests"""
+    pass
+
+# URLs par défaut avec rotation (miroirs ForexFactory)
+DEFAULT_URLS = deque([
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    "https://rdb-nfs.faireconomy.media/ff_calendar_thisweek.xml",   # miroir officiel
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.xml"    # autre miroir
+])
+
+class MacroCollector:
+    """Collecte et traite les actualités macroéconomiques depuis un flux XML."""
+    
+    def __init__(self, xml_url, update_interval=1800, max_events_count=25, 
+                 filter_impact=None, filter_countries=None, filter_keywords=None,
+                 output_format="detailed", debug_mode=False):
+        """
+        Initialise le collecteur de données macroéconomiques.
+
+        Args:
+            xml_url (str): URL ou chemin du flux XML ForexFactory.
+            update_interval (int): Intervalle de mise à jour en secondes (défaut: 30 minutes)
+            max_events_count (int): Nombre maximum d'événements à conserver
+            filter_impact (list): Filtrer par niveau d'impact ("High", "Medium", "Low") ou None pour tous
+            filter_countries (list): Filtrer par pays ("USD", "EUR", "JPY", etc.) ou None pour tous
+            filter_keywords (list): Filtrer par mots-clés dans le titre ou None pour tous
+            output_format (str): Format de sortie ("detailed", "summary", "bullets")
+            debug_mode (bool): Activer le mode debug pour afficher les données envoyées au LLM
+        """
+        self.xml_url = xml_url
+        self.update_interval = update_interval
+        self.max_events_count = max_events_count
+        # Par défaut, inclure uniquement les événements High et Medium impact si aucun filtre n'est spécifié
+        self.filter_impact = filter_impact or ["High", "Medium"]  
+        self.filter_countries = filter_countries or []  # Liste des pays à inclure ("USD", "EUR", etc.)
+        self.filter_keywords = filter_keywords or []  # Liste des mots-clés à rechercher dans le titre
+        self.output_format = output_format
+        self.debug_mode = debug_mode
+        self.latest_events = []
+        self.historical_events = []  # Pour garder un historique sur plusieurs semaines
+        self.last_update_time = None
+        self.summary = "Pas de données macroéconomiques disponibles."
+        import os
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        LOGS_DIR = os.path.normpath(os.path.join(BASE_DIR, '../../logs'))
+        self.log_file = os.path.join(LOGS_DIR, "macro_log.json")
+        self.historical_log_file = os.path.join(LOGS_DIR, "macro_historical_log.json")
+        self.stop_event = Event()
+        self.update_thread = None
+        
+        # Paramètres pour le backoff exponentiel
+        self.urls = DEFAULT_URLS.copy()
+        self.backoff_seconds = 60   # 1 min au 1er échec
+        self.max_backoff = 1800    # 30 min max
+        
+        self._load_from_log()
+
+    def _load_from_log(self):
+        # Charger les événements récents
+        if os.path.exists(self.log_file):
+            try:
+                with open(self.log_file, 'r') as f:
+                    log_data = json.load(f)
+                    self.latest_events = log_data.get('latest_events', [])
+                    self.last_update_time = log_data.get('last_update_time')
+                    self.summary = log_data.get('summary', self.summary)
+                    logger.info(f"Chargé {len(self.latest_events)} événements récents depuis le fichier log")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement du fichier log: {e}")
+        
+        # Charger l'historique des événements
+        if os.path.exists(self.historical_log_file):
+            try:
+                with open(self.historical_log_file, 'r') as f:
+                    historical_data = json.load(f)
+                    self.historical_events = historical_data.get('events', [])
+                    logger.info(f"Chargé {len(self.historical_events)} événements historiques")
+            except Exception as e:
+                logger.error(f"Erreur lors du chargement de l'historique: {e}")
+
+    def _save_to_log(self):
+        # Sauvegarder les événements récents
+        try:
+            with open(self.log_file, 'w') as f:
+                log_data = {
+                    'latest_events': self.latest_events,
+                    'last_update_time': self.last_update_time,
+                    'summary': self.summary
+                }
+                json.dump(log_data, f, indent=2)
+                logger.info(f"Sauvegardé {len(self.latest_events)} événements récents dans le fichier log")
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde du fichier log: {e}")
+            
+        # Mettre à jour et sauvegarder l'historique
+        try:
+            # Éviter les doublons en fusionnant avec l'historique existant
+            # en utilisant l'URL comme identifiant unique
+            event_urls = {event.get('url'): True for event in self.historical_events}
+            
+            # Ajouter uniquement les nouveaux événements à l'historique
+            for event in self.latest_events:
+                if event.get('url') and event.get('url') not in event_urls:
+                    self.historical_events.append(event)
+                    event_urls[event.get('url')] = True
+            
+            # Limiter la taille de l'historique (garder les 500 plus récents par exemple)
+            max_historical = 500
+            if len(self.historical_events) > max_historical:
+                self.historical_events = self.historical_events[-max_historical:]
+            
+            with open(self.historical_log_file, 'w') as f:
+                historical_data = {
+                    'events': self.historical_events,
+                    'last_update': datetime.now().isoformat()
+                }
+                json.dump(historical_data, f, indent=2)
+                logger.info(f"Sauvegardé {len(self.historical_events)} événements dans l'historique")
+        except Exception as e:
+            logger.error(f"Erreur lors de la sauvegarde de l'historique: {e}")
+
+    def _fetch_xml(self) -> Optional[str]:
+        """
+        Essaye chaque URL avec gestion 429 + back-off exponentiel.
+        
+        Returns:
+            str: Contenu XML récupéré ou None en cas d'échec
+        """
+        # Vérifier d'abord si un cache récent existe
+        path_cache = Path(os.path.dirname(self.log_file)) / "ff_calendar_cache.xml"
+        if path_cache.exists() and (time.time() - path_cache.stat().st_mtime) < 3600:
+            logger.info("🗄️ Utilisation du cache local (moins de 1 h)")
+            return path_cache.read_text()
+        
+        # Ajouter l'URL configurée en premier dans la rotation si elle n'y est pas déjà
+        if self.xml_url and self.xml_url not in self.urls:
+            self.urls.appendleft(self.xml_url)
+        
+        # Essayer chaque URL dans la rotation
+        for _ in range(len(self.urls)):
+            url = self.urls[0]  # URL en tête de file
+            try:
+                logger.info(f"Tentative de récupération depuis: {url}")
+                resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+                
+                if resp.status_code == 429:
+                    raise RateLimitError("429 Too Many Requests")
+                
+                resp.raise_for_status()
+                
+                # En cas de succès, réinitialiser le backoff
+                self.backoff_seconds = 60
+                
+                # Sauvegarder dans le cache local
+                path_cache.write_text(resp.text)
+                
+                return resp.text
+                
+            except (RateLimitError, requests.RequestException) as exc:
+                logger.warning(f"Échec {exc} – back-off {self.backoff_seconds} s")
+                time.sleep(self.backoff_seconds + random.uniform(0, 5))
+                self.backoff_seconds = min(self.backoff_seconds * 2, self.max_backoff)
+                # Passe l'URL qui vient d'échouer en fin de deque
+                self.urls.rotate(-1)
+        
+        logger.error("Échec de récupération depuis toutes les sources après back-off")
+        return None
+    
+    def fetch_events(self):
+        """
+        Récupère les événements macroéconomiques depuis le flux XML avec sources de backup et backoff exponentiel.
+        
+        Returns:
+            bool: True si la récupération a réussi, False sinon
+        """
+        # Récupérer le contenu XML avec notre nouvelle méthode
+        xml_content = self._fetch_xml()
+        
+        if not xml_content:
+            return False
+            
+        # Vérifier que le contenu est bien du XML
+        if "<" not in xml_content[:100]:
+            logger.warning("Le contenu ne semble pas être du XML valide")
+            return False
+            
+        try:
+            root = ET.fromstring(xml_content)
+            new_events = []
+            event_count = 0
+            
+            # Source pour le logging
+            source_url = "cache" if "cache" in str(self.urls[0]) else self.urls[0]
+            
+            for event in root.findall('.//event'):
+                try:
+                    title = event.find('title').text if event.find('title') is not None else "Unknown"
+                    country = event.find('country').text if event.find('country') is not None else "Unknown"
+                    date = event.find('date').text if event.find('date') is not None else "Unknown"
+                    time = event.find('time').text if event.find('time') is not None else "Unknown"
+                    impact = event.find('impact').text if event.find('impact') is not None else "Unknown"
+                    forecast = event.find('forecast').text if event.find('forecast') is not None else "N/A"
+                    previous = event.find('previous').text if event.find('previous') is not None else "N/A"
+                    
+                    # Vérifier la validité des données essentielles
+                    if not title or not country or not date:
+                        continue
+                    
+                    # Vérifier si l'événement correspond aux filtres
+                    if not self._apply_filters(title, country, impact):
+                        continue
+                        
+                    # Convertir la date et l'heure au format timestamp
+                    timestamp = self._parse_event_datetime(date, time)
+                    
+                    event_data = {
+                        "title": title,
+                        "country": country,
+                        "date": date,
+                        "time": time,
+                        "impact": impact,
+                        "forecast": forecast,
+                        "previous": previous,
+                        "timestamp": timestamp,
+                        "source": source_url
+                    }
+                    
+                    new_events.append(event_data)
+                    event_count += 1
+                except Exception as event_error:
+                    logger.warning(f"Erreur lors du traitement d'un événement: {event_error}")
+                    continue
+            
+            # Vérifier que nous avons reçu un nombre raisonnable d'événements
+            if event_count < 3:
+                logger.warning(f"Seulement {event_count} événements trouvés depuis {source_url}, données possiblement incomplètes")
+                return False
+            
+            # Trier les événements par date/heure (plus récents en premier)
+            new_events.sort(key=lambda x: x["timestamp"] if x["timestamp"] else "", reverse=True)
+            
+            # Limiter le nombre d'événements
+            self.latest_events = new_events[:self.max_events_count]
+            
+            # Ajouter à l'historique (sans duplication)
+            for event in self.latest_events:
+                # Vérifier si l'événement existe déjà dans l'historique
+                if not any(e["title"] == event["title"] and e["date"] == event["date"] and e["time"] == event["time"] for e in self.historical_events):
+                    self.historical_events.append(event)
+            
+            # Limiter la taille de l'historique (garder les 500 plus récents)
+            self.historical_events = sorted(self.historical_events, key=lambda x: x["timestamp"] if x["timestamp"] else "", reverse=True)[:500]
+            
+            # Générer le résumé selon le format de sortie
+            self._generate_summary()
+            
+            # Enregistrer dans les fichiers log
+            self._save_to_log()
+            
+            logger.info(f"Récupéré {len(self.latest_events)} événements")
+            return True
+            
+        except ET.ParseError as xml_error:
+            logger.warning(f"Erreur de parsing XML: {xml_error}")
+        
+        # Si on arrive ici, le parsing XML a échoué malgré un contenu récupéré
+        logger.error("Échec de traitement du XML valide")
+        return False
+
+    def _apply_filters(self, title, country, impact):
+        """
+        Applique les filtres configurés à un événement
+        """
+        # Filtre par impact
+        if self.filter_impact and impact and impact not in self.filter_impact:
+            return False
+            
+        # Filtre par pays/devise
+        if self.filter_countries and country:
+            # Si le pays n'est pas directement dans la liste des filtres
+            if country not in self.filter_countries:
+                # Vérifier si le code pays à 3 lettres est dans la liste
+                country_code = country.upper()
+                if country_code not in self.filter_countries:
+                    return False
+        
+        # Filtre par mots-clés dans le titre
+        if self.filter_keywords and title:
+            found_keyword = False
+            for keyword in self.filter_keywords:
+                if keyword.lower() in title.lower():
+                    found_keyword = True
+                    break
+            if not found_keyword:
+                return False
+        return True
+        
+    def _to_local_timezone(self, dt):
+        """
+        Convertit un datetime UTC en heure locale (Europe/Paris)
+        
+        Args:
+            dt (datetime): Objet datetime, avec ou sans timezone
+            
+        Returns:
+            datetime: Datetime converti en timezone locale
+        """
+        # Si le datetime n'a pas de timezone, on considère qu'il est en UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pytz.UTC)
+        # Conversion en heure locale
+        return dt.astimezone(LOCAL_TZ)
+    
+    def _parse_event_datetime(self, date_str, time_str):
+        """
+        Convertit la date et l'heure du format ForexFactory en timestamp ISO
+        
+        Note: Les dates dans le flux ForexFactory sont déjà en heure locale (Europe/Paris).
+        """
+        try:
+            # Format typique: date="05-11-2025" time="6:00pm"
+            if not date_str or not time_str:
+                return None
+                
+            # Nettoyer les données (pour enlever CDATA si présent)
+            date_str = date_str.strip()
+            time_str = time_str.strip()
+            if date_str.startswith('<![CDATA['):
+                date_str = date_str[9:-3].strip()
+            if time_str.startswith('<![CDATA['):
+                time_str = time_str[9:-3].strip()
+                
+            # Convertir au format datetime
+            try:
+                # Essayer le format "MM-DD-YYYY"
+                date_parts = date_str.split('-')
+                if len(date_parts) == 3:
+                    month, day, year = date_parts
+                    
+                    # Convertir l'heure (format 12h avec AM/PM)
+                    is_pm = 'pm' in time_str.lower()
+                    time_str = time_str.lower().replace('am', '').replace('pm', '').strip()
+                    if ':' in time_str:
+                        hour, minute = time_str.split(':')[:2]
+                    else:
+                        hour, minute = time_str, '00'
+                        
+                    hour = int(hour)
+                    if is_pm and hour < 12:
+                        hour += 12
+                    elif not is_pm and hour == 12:
+                        hour = 0
+                        
+                    # Créer l'objet datetime déjà en heure locale
+                    local_time = datetime(int(year), int(month), int(day), hour, int(minute), tzinfo=LOCAL_TZ)
+                    
+                    # Débogage pour vérifier l'heure (uniquement en mode debug)
+                    if self.debug_mode:
+                        logger.debug(f"Heure ForexFactory (locale): {local_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+                    
+                    return local_time.isoformat()
+            except Exception as e:
+                logger.warning(f"Erreur lors du parsing de la date: {date_str} {time_str} - {e}")
+                
+            return None
+        except Exception as e:
+            logger.warning(f"Impossible de parser la date/heure: {e}")
+            return None
+            
+    def _generate_summary(self):
+        """Génère un résumé des événements importants pour le LLM."""
+        if not self.latest_events:
+            self.summary = "Pas de données macroéconomiques disponibles."
+            return
+            
+        # Générer selon le format demandé
+        if self.output_format == "bullets":
+            self.summary = self._generate_bullets_format()
+        elif self.output_format == "summary":
+            self.summary = self._generate_natural_summary()
+        else:  # Format détaillé par défaut
+            self.summary = self._generate_detailed_format()
+    
+    def _generate_detailed_format(self):
+        """Format détaillé avec tous les champs pour chaque événement"""
+        summary_parts = ["### Calendrier Macroéconomique à venir (Heure locale: Europe/Paris)\n"]
+        
+        # Grouper par date pour une meilleure lisibilité
+        events_by_date = {}
+        for event in self.latest_events:
+            date = event.get('date', 'Date inconnue')
+            if date not in events_by_date:
+                events_by_date[date] = []
+            events_by_date[date].append(event)
+            
+        # Générer le résumé par date
+        for date, events in sorted(events_by_date.items()):
+            summary_parts.append(f"## {date}\n")
+            for i, event in enumerate(events, 1):
+                impact_emoji = "🔴" if event['impact'] == "High" else "🟠" if event['impact'] == "Medium" else "🟢"
+                summary_parts.append(
+                    f"{i}. {impact_emoji} **{event['title']}** ({event['country']}, {event['time']})\n"
+                    f"    Prévision: {event['forecast'] or 'N/A'} | Précédent: {event['previous'] or 'N/A'}\n"
+                    f"    [Détails]({event['url']})\n"
+                )
+        
+        return "\n".join(summary_parts)
+    
+    def _generate_bullets_format(self):
+        """Format simplifié en bullet points, optimisé pour le LLM avec groupement par date et devise"""
+        # Conversion des dates pour faciliter le tri
+        for event in self.latest_events:
+            try:
+                if event.get('timestamp'):
+                    dt = datetime.fromisoformat(event['timestamp'].split('T')[0])
+                    event['sort_date'] = dt
+                else:
+                    event['sort_date'] = datetime.now()
+            except Exception:
+                event['sort_date'] = datetime.now()
+                
+        # Trier les événements par date puis par heure
+        sorted_events = sorted(self.latest_events, key=lambda e: (e['sort_date'], e.get('time', '')))
+        
+        # Grouper par date
+        events_by_date = {}
+        for event in sorted_events:
+            date_key = event['date'] if 'date' in event else 'Date inconnue'
+            if date_key not in events_by_date:
+                events_by_date[date_key] = []
+            events_by_date[date_key].append(event)
+            
+        # Grouper par devise pour chaque date
+        summary_parts = ["### Calendrier Économique - Événements Clés\n"]
+        
+        # Pour chaque date
+        for date, events in events_by_date.items():
+            summary_parts.append(f"## {date} (Heure locale: Europe/Paris)\n")
+            
+            # Regrouper par devise
+            events_by_currency = {}
+            for event in events:
+                currency = event.get('country', 'Autre')
+                if currency not in events_by_currency:
+                    events_by_currency[currency] = []
+                events_by_currency[currency].append(event)
+                
+            # Listing des événements par devise
+            for currency, currency_events in events_by_currency.items():
+                summary_parts.append(f"**{currency}:**")
+                
+                for event in currency_events:
+                    # Marqueurs visuels d'impact: ⚫️⚫️⚫️ (High), ⚫️⚫️ (Medium), ⚫️ (Low)
+                    impact_dots = ""
+                    if event['impact'] == "High":
+                        impact_dots = "⚫️⚫️⚫️"
+                    elif event['impact'] == "Medium":
+                        impact_dots = "⚫️⚫️"
+                    else:
+                        impact_dots = "⚫️"
+                        
+                    # Format: time - title - impact - forecast/previous
+                    forecast_prev = ""
+                    if event.get('forecast') or event.get('previous'):
+                        forecast = event.get('forecast', 'N/A')
+                        previous = event.get('previous', 'N/A')
+                        forecast_prev = f" (Prév: {forecast}, Préc: {previous})"
+                        
+                    summary_parts.append(f"* {event.get('time', '??:??')} - {event.get('title', 'Inconnu')} - {impact_dots}{forecast_prev}")
+                
+                summary_parts.append("") # Ligne vide entre les devises
+                
+        return "\n".join(summary_parts)
+    
+    def _generate_natural_summary(self):
+        """Format résumé en langage naturel pour le LLM"""
+        # Regrouper par importance puis par pays
+        high_impact = [e for e in self.latest_events if e.get('impact') == "High"]
+        medium_impact = [e for e in self.latest_events if e.get('impact') == "Medium"]
+        
+        # Regrouper par pays
+        countries = {}
+        for event in high_impact + medium_impact:
+            country = event.get('country', 'Autre')
+            if country not in countries:
+                countries[country] = []
+            countries[country].append(event)
+            
+        parts = ["### Synthèse des Événements Macroéconomiques\n"]
+        
+        # Événements à fort impact
+        if high_impact:
+            parts.append("#### Événements Majeurs À Surveiller (Heure locale: Europe/Paris)\n")
+            for event in high_impact:
+                parts.append(f"- **{event['date']} {event['time']}** : {event['title']} ({event['country']})")
+            parts.append("")
+            
+        # Résumé par pays (pour USD, EUR, GBP, JPY principalement)
+        parts.append("#### Analyse par Devise\n")
+        major_currencies = ['USD', 'EUR', 'GBP', 'JPY']
+        for currency in major_currencies:
+            if currency in countries and countries[currency]:
+                parts.append(f"**{currency}**: ")
+                event_descriptions = []
+                for event in countries[currency][:3]:  # Top 3 par devise
+                    event_descriptions.append(f"{event['title']} ({event['date']}){' - ' + event['forecast'] if event['forecast'] else ''}")
+                parts.append(", ".join(event_descriptions) + ".")
+                parts.append("")
+                
+        # Analyse de l'impact global
+        parts.append("#### Impact Potentiel sur le Marché\n")
+        if high_impact:
+            parts.append("Les événements macroéconomiques à venir pourraient générer une importante volatilité ")
+            parts.append(f"particulièrement pour les devises: {', '.join(set([e['country'] for e in high_impact]))}. ")
+            parts.append("Préparez-vous à un possible élargissement des spreads et à des mouvements directionnels forts.")
+        else:
+            parts.append("Aucun événement à fort impact n'est prévu. Les marchés devraient rester relativement stables.")
+            
+        return "\n".join(parts)
+
+    def start_auto_update(self):
+        if self.update_thread is None or not self.update_thread.is_alive():
+            self.stop_event.clear()
+            self.update_thread = Thread(target=self._auto_update_loop, daemon=True)
+            self.update_thread.start()
+            logger.info(f"Démarrage des mises à jour automatiques toutes les {self.update_interval} secondes")
+
+    def stop_auto_update(self):
+        if self.update_thread and self.update_thread.is_alive():
+            self.stop_event.set()
+            self.update_thread.join(timeout=1.0)
+            logger.info("Arrêt des mises à jour automatiques")
+
+    def _auto_update_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.fetch_events()
+            except Exception as e:
+                logger.error(f"Erreur dans la boucle de mise à jour automatique: {e}")
+            self.stop_event.wait(self.update_interval)
+            
+    def get_events_next_24h(self, hours_ahead=24):
+        """
+        Extrait uniquement les événements macroéconomiques qui auront lieu dans les prochaines heures.
+        
+        Args:
+            hours_ahead (int): Nombre d'heures à regarder en avant (24h par défaut)
+            
+        Returns:
+            list: Liste des événements filtrés pour les prochaines heures
+        """
+        now = datetime.now()
+        future = now + timedelta(hours=hours_ahead)
+        
+        filtered_events = []
+        
+        for event in self.latest_events:
+            # Vérifier si l'événement a un timestamp valide
+            event_time = None
+            
+            # Si le timestamp est déjà au format ISO
+            if 'timestamp' in event and event['timestamp']:
+                try:
+                    event_time = datetime.fromisoformat(event['timestamp'])
+                except (ValueError, TypeError):
+                    pass
+            
+            # Sinon, essayer de reconstruire le timestamp à partir de date et time
+            if not event_time and 'date' in event and 'time' in event:
+                timestamp_str = self._parse_event_datetime(event['date'], event['time'])
+                if timestamp_str:
+                    try:
+                        event_time = datetime.fromisoformat(timestamp_str)
+                    except (ValueError, TypeError):
+                        pass
+            
+            # Si on a réussi à extraire un timestamp, comparer avec now et future
+            if event_time and now <= event_time <= future:
+                filtered_events.append(event)
+                
+        # Trier par date/heure croissante
+        filtered_events.sort(key=lambda x: x.get('timestamp', '') if x.get('timestamp') else '')
+        
+        return filtered_events
+    
+    def get_macro_context(self, format=None, hours_ahead=None):
+        """
+        Récupère le contexte macroéconomique actuel formaté pour le LLM.
+        
+        Args:
+            format (str, optional): Format de sortie spécifique ('detailed', 'summary', 'bullets')
+                               Si None, utilise le format configuré dans l'objet
+            hours_ahead (int, optional): Si spécifié, filtre uniquement les événements à venir dans ce délai
+        
+        Returns:
+            str: Résumé formaté des événements macroéconomiques
+        """
+        # Mettre à jour les données si obsolètes
+        if (self.last_update_time is None or 
+            (datetime.now() - datetime.fromisoformat(self.last_update_time)).total_seconds() > self.update_interval):
+            logger.info("Données macroéconomiques obsolètes, tentative de mise à jour...")
+            self.fetch_events()
+        
+        # Filtrer les événements par heure si demandé
+        original_events = None
+        if hours_ahead is not None:
+            original_events = self.latest_events
+            self.latest_events = self.get_events_next_24h(hours_ahead=hours_ahead)
+            if not self.latest_events:
+                result = f"Aucun événement macroéconomique prévu dans les prochaines {hours_ahead} heures."
+                # Restaurer les événements originaux
+                if original_events:
+                    self.latest_events = original_events
+                return result
+            
+        # Si aucun format spécifique n'est demandé, retourner le format par défaut
+        if format is None:
+            format = self.output_format
+            
+        # Générer le format demandé à la volée
+        if not self.latest_events:
+            result = "Pas de données macroéconomiques disponibles."
+        elif format == "detailed":
+            result = self._generate_detailed_format()
+        elif format == "bullets":
+            result = self._generate_bullets_format()
+        elif format == "summary":
+            result = self._generate_natural_summary()
+        else:
+            # Format inconnu, on retourne le format par défaut
+            result = self.summary
+            
+        # Restaurer les événements originaux si nécessaire
+        if original_events:
+            self.latest_events = original_events.copy()
+            
+        return result
+            
+    def get_events_next_hours(self, hours_ahead=24):
+        """
+        Récupère les événements prévus dans les prochaines heures.
+        
+        Args:
+            hours_ahead (int): Nombre d'heures à considérer
+            
+        Returns:
+            list: Liste des événements filtrés pour les prochaines heures
+        """
+        now = datetime.now()
+    future = now + timedelta(hours=hours_ahead)
+    
+    filtered_events = []
+    
+    for event in self.latest_events:
+        # Vérifier si l'événement a un timestamp valide
+        event_time = None
+        
+        # Si le timestamp est déjà au format ISO
+        if 'timestamp' in event and event['timestamp']:
+            try:
+                event_time = datetime.fromisoformat(event['timestamp'])
+            except (ValueError, TypeError):
+                pass
+        
+        # Sinon, essayer de reconstruire le timestamp à partir de date et time
+        if not event_time and 'date' in event and 'time' in event:
+            timestamp_str = self._parse_event_datetime(event['date'], event['time'])
+            if timestamp_str:
+                try:
+                    event_time = datetime.fromisoformat(timestamp_str)
+                except Exception:
+                    event_time = None
+                    
+        return event_time is not None and now <= event_time <= future
+    
+    def get_historical_events_summary(self, days_back=7, format="summary"):
+        """
+        Récupère un résumé des événements macroéconomiques passés.
+        
+        Args:
+            days_back (int): Nombre de jours en arrière à regarder
+            format (str): Format de présentation ('detailed', 'summary', 'bullets')
+            
+        Returns:
+            str: Résumé des événements historiques
+        """
+        if not self.historical_events:
+            return "Pas de données historiques disponibles."
+            
+        # Calculer la date limite
+        cutoff_date = (datetime.now() - timedelta(days=days_back))
+        cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+        
+        # Filtrer les événements historiques dans la période
+        filtered_events = []
+        for event in self.historical_events:
+            if 'timestamp' in event and event['timestamp']:
+                # Si on a un timestamp ISO format
+                try:
+                    event_date = datetime.fromisoformat(event['timestamp'].split('T')[0])
+                    if event_date >= cutoff_date:
+                        filtered_events.append(event)
+                except (ValueError, TypeError):
+                    # Si parsedate échoue, on essaie avec le format date string
+                    pass
+            
+            # Fallback sur le champ date si timestamp n'est pas valide
+            if 'date' in event and event not in filtered_events:
+                try:
+                    date_parts = event['date'].split('-')
+                    if len(date_parts) == 3:
+                        month, day, year = date_parts
+                        event_date_str = f"{year}-{month}-{day}"
+                        if event_date_str >= cutoff_str:
+                            filtered_events.append(event)
+                except Exception:
+                    pass
+        
+        # Sauvegarde temporaire et génération du format demandé
+        original_events = self.latest_events
+        self.latest_events = filtered_events
+        
+        if format == "detailed":
+            result = self._generate_detailed_format()
+        elif format == "bullets":
+            result = self._generate_bullets_format()
+        elif format == "summary":
+            result = self._generate_natural_summary()
+        else:
+            # Format par défaut
+            result = self._generate_detailed_format()
+            
+        # Restaurer les événements originaux
+        self.latest_events = original_events
+        
+        return result
+
+    def start_auto_update(self):
+        if self.update_thread is None or not self.update_thread.is_alive():
+            self.stop_event.clear()
+            self.update_thread = Thread(target=self._auto_update_loop, daemon=True)
+            self.update_thread.start()
+            logger.info(f"Démarrage des mises à jour automatiques toutes les {self.update_interval} secondes")
+
+    def stop_auto_update(self):
+        if self.update_thread and self.update_thread.is_alive():
+            self.stop_event.set()
+            self.update_thread.join(timeout=1.0)
+            logger.info("Arrêt des mises à jour automatiques")
+
+    def _auto_update_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                self.fetch_events()
+            except Exception as e:
+                logger.error(f"Erreur dans la boucle de mise à jour automatique: {e}")
+            self.stop_event.wait(self.update_interval)
+
+# Test du module s'il est exécuté directement
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        xml_url = sys.argv[1]
+    else:
+        xml_url = "weeklyevents.xml"  # Par défaut, fichier local
+    collector = MacroCollector(xml_url)
+    success = collector.fetch_events()
+
+    if success:
+        print("\nÉvénements macroéconomiques récupérés avec succès !\n")
+        print(collector.get_macro_context())
+    else:
+        print("\nÉchec de la récupération des événements macroéconomiques.")

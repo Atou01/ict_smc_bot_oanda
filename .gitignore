@@ -1,0 +1,43 @@
+# Python virtual environments
+venv*/
+
+# Byte-compiled / optimized / DLL files
+# Python cache and virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE and OS files
+.DS_Store
+*.swp
+
+# Logs and outputs
+logs/
+*.log
+*.csv
+*.json
+!assets/manifest.json
+*.png
+!assets/icon-192.png
+!assets/icon-512.png
+
+# Test cache
+.pytest_cache/
+
+# Local config overrides
+config/local_*.yaml
+
+# Database and logs
+*.db
+*.log
+
+# Jupyter and IPython
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+# Autorise les fichiers PWA
+!assets/manifest.json
+!assets/service-worker.js
+

@@ -1,0 +1,5 @@
+type: vantage
+login: ${VANTAGE_LOGIN}
+password: ${VANTAGE_PWD}
+server: VantageInternational-Demo
+base_currency: EUR

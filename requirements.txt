@@ -1,0 +1,8 @@
+openai
+python-dotenv
+MetaTrader5
+pandas
+numpy
+requests
+discord.py
+streamlit

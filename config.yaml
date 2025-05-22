@@ -49,12 +49,12 @@ discord_llm:
   channel_id: "1373644384058474556"  # À remplacer par l'ID du salon Discord cible si besoin
   allowed_users: ["782584140780404747"]
   # Clé API OpenAI (à garder secrète, ou à passer par variable d'environnement OPENAI_API_KEY)
-  openai_api_key: ${OPENAI_API_KEY}  # Jamais de clé en dur !
+  # openai_api_key: ${OPENAI_API_KEY}  # Jamais de clé en dur !
   # Modèle GPT à utiliser (ex: gpt-4, gpt-3.5-turbo, etc.)
   gpt_model: "gpt-4"
 
 OPENAI:
-  api_key: ${OPENAI_API_KEY}         # Clé API OpenAI pour le LLM
+  # api_key: ${OPENAI_API_KEY}         # Clé API OpenAI pour le LLM
 
 XML_FEED_URL: "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"   # Flux XML des événements macroéconomiques
 XML_UPDATE_INTERVAL: 1800                                # Intervalle de mise à jour en secondes (30 min)

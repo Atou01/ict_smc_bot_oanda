@@ -5,7 +5,7 @@ Projet Python pour un bot de trading Forex automatisé basé sur les Smart Money
 ## Structure du projet
 
 ```
-ict_smc_bot_ib_insync/
+bot_vantage_mt5/
 ├─ config.yaml          # Configuration IBKR, symboles, timeframes, risk, calendar
 ├─ requirements.txt     # Dépendances Python
 ├─ README.md            # Ce fichier

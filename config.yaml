@@ -1,25 +1,71 @@
+# =========================
+# TEMPLATE DE CONFIGURATION
+# =========================
+# Copiez ce fichier en config.yaml et adaptez-le à votre environnement.
+
 IBKR:
-  host: 127.0.0.1
-  port: 7497
-  clientId: 1
-  account: U1234567
-  symbols:
+  host: 127.0.0.1           # Adresse IP du gateway IBKR
+  port: 4002                # Port du gateway IBKR
+  clientId: 2               # ID client unique pour la session API
+  account: U1234567         # Numéro de compte IBKR
+  symbols:                  # Liste des symboles à trader
     - EURUSD
     - USDJPY
+    - GBPUSD
+
 TIMEFRAMES:
-  analysis: "H1"
-  exec: "1 min"
-LIVE: true
-MAX_DRAWDOWN: 5  # % max drawdown before halting live trading
-MAX_SLIPPAGE: 2  # max slippage in pips for live orders
-  - "EUR_USD"
-  - "GBP_USD"
-  - "USD_JPY"
-TIMEFRAMES:
-  analysis: "H1"
-  exec: "M15"
+  analysis: "H1"            # Timeframe pour l'analyse
+  exec: "M15"               # Timeframe pour l'exécution des trades
+
+LIVE: true                  # true = trading réel, false = backtest ou simulation
+
+MAX_DRAWDOWN: 5             # % max de drawdown global (sécurité supplémentaire)
+MAX_SLIPPAGE: 2             # Slippage max toléré (en pips)
+
 RISK:
-  risk_per_trade: 1  # % du capital par trade
+  capital: 10000            # Capital de référence (EUR/USD)
+  risk_pct: 1.0             # % du capital risqué par trade
+  max_drawdown_pct: 3.0     # % max de drawdown avant blocage automatique
+
+BROKER:
+  mode: Demo          # Mode d'exécution : Simulation | Demo | Live | Backtest
+
 CALENDAR:
-  source: "forexfactory"
-  timezone: "UTC"
+  source: "forexfactory"    # Source du calendrier économique
+  timezone: "UTC"           # Fuseau horaire pour les événements
+
+DISCORD:
+  # Webhook pour les alertes de sécurité (drawdown, blocage, erreurs critiques, activation/désactivation du bot)
+  security_webhook_url: "https://discord.com/api/webhooks/1373644384058474556/CoMdCX90_3qsTiq4M1syP47QEliEzJ3gh5DuIBNb_U6SxQOp9OZzSkx0xd2pcuDWcVOX"  # Laisser vide pour désactiver
+  # Webhook pour les notifications générales (prises de position, stratégies, signaux, annonces importantes)
+  notif_webhook_url: "https://discord.com/api/webhooks/1371113889525399573/jpZfs-84cJ0C5TOnCwnVTrpkvv7QM8EnD3oSwG85qQlwu14o2HipRZTh3gJ7KTWhxZp_"  # Laisser vide pour désactiver
+  # (Optionnel, pour compatibilité ancienne version)
+  webhook_url: "https://discord.com/api/webhooks/xxx/yyy"  # Ancien champ unique, sera utilisé si les deux autres ne sont pas définis
+
+discord_llm:
+  # Token du bot Discord (à garder secret, ou à passer par variable d'environnement DISCORD_LLM_BOT_TOKEN)
+  token: "***REMOVED***"
+  # ID du salon Discord où le bot doit répondre (ex: 123456789012345678)
+  channel_id: "1373644384058474556"  # À remplacer par l'ID du salon Discord cible si besoin
+  allowed_users: ["782584140780404747"]
+  # Clé API OpenAI (à garder secrète, ou à passer par variable d'environnement OPENAI_API_KEY)
+  openai_api_key: "***REMOVED***"
+  # Modèle GPT à utiliser (ex: gpt-4, gpt-3.5-turbo, etc.)
+  gpt_model: "gpt-4"
+
+OPENAI:
+  api_key: "***REMOVED***"         # Clé API OpenAI pour le LLM
+
+XML_FEED_URL: "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"   # Flux XML des événements macroéconomiques
+XML_UPDATE_INTERVAL: 1800                                # Intervalle de mise à jour en secondes (30 min)
+XML_FILTER_IMPACT: ["High", "Medium"]                   # Niveaux d'impact à inclure (High, Medium, Low)
+XML_FILTER_COUNTRIES: ["USD", "EUR", "GBP", "JPY"]      # Devises à suivre
+XML_OUTPUT_FORMAT: "summary"                            # Format d'affichage (detailed, bullets, summary)
+
+# =========================
+# AJOUTEZ D'AUTRES SECTIONS SI BESOIN
+# =========================
+# Exemple :
+# LOGGING:
+#   level: INFO
+#   file: bot.log

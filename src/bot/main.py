@@ -1,7 +1,12 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+print(">>> DEBUG, OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
+print("ENV KEY:", os.getenv("OPENAI_API_KEY"))
 import yaml
 import json
-import os
 import platform
+
 if platform.system() == "Windows":
     from mt5_client import Mt5Client
 else:
@@ -146,7 +151,9 @@ except Exception as e:
     sys.exit(1)
 
 # --- Initialisation composants ---
-api_key = cfg["OPENAI"]["api_key"]
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError("Clé OpenAI manquante !")
 
 # Vérifier si le mode debug est activé
 debug_llm = os.environ.get("DEBUG_LLM", "False").lower() == "true"
@@ -183,7 +190,9 @@ macro_collector.start_auto_update()
 
 initial_capital = float(cfg.get('RISK', {}).get('capital', 10000))
 pnl_tracker = PnLTracker(initial_capital=initial_capital)
+# --- PATCH : Passage de l'instance Mt5Client à OrderManager pour exécution MT5 native ---
 order_manager = OrderManager(cfg, pnl_tracker, ib=None)
+order_manager.mt5_client = mt5  # Injection explicite du client MT5
 detector = StructureDetector()
 selector = StrategySelector(llm, macro_bias_manager=macro_bias_manager)
 
@@ -203,6 +212,11 @@ llm_interval = 1800  # 30 minutes par défaut
 # Initialisation correcte de l'état initial du bot
 state = read_shared_state()
 last_bot_on = state.get("bot_on", False)
+# --- INIT CACHE LLM & STRUCTURES ---
+last_structures = []
+structures_detected = []
+solo_tech_mode = False
+
 while True:
     # Contrôle centralisé via dashboard
     state = read_shared_state()
@@ -235,9 +249,10 @@ while True:
     ob_signals = detector.detect_ob()
     bos_signals = detector.detect_bos()
     sweep_signals = detector.detect_sweep()
+    structures_detected = fvg_signals + ob_signals + bos_signals + sweep_signals
     structures_text = [
         f"{s['type']} {s['side']} sur {s['timeframe']}"
-        for s in (fvg_signals + ob_signals + bos_signals + sweep_signals)
+        for s in structures_detected
     ]
     pnl_summary = "Risque défini à 1%, drawdown max 3% atteint hier."
 
@@ -389,56 +404,162 @@ while True:
             risk_status["max_risk_pct"] = risk_pct  # Ajout de la clé manquante pour le test
             print(f"[BOT][TEST] Risk status complété avec max_risk_pct={risk_pct}%")
             
-        # Générer une recommandation de trading structurée
-        print(f"[BOT][LLM] Génération de recommandation de trading basée sur l'analyse...")
-        trade_recommendation = llm.generate_trade_recommendation(
-            macro_analysis=strategie_complete,
-            technical_analysis=f"Structures détectées: {structures_text}",
-            risk_status=risk_status
-        )
+        # --- NOUVEAU PIPELINE LLM avec llm_engine ---
+        # Import du nouveau module LLM (encapsulé et découplé)
+        try:
+            from llm_engine import decide_trade
+            print("[BOT][LLM] Utilisation du nouveau module llm_engine pour l'analyse LLM")
+            use_new_llm_engine = True
+        except ImportError as e:
+            print(f"[BOT][LLM] Module llm_engine non disponible, utilisation du pipeline LLM classique: {e}")
+            use_new_llm_engine = False
         
-        if trade_recommendation:
-            print(f"[BOT][LLM] Recommandation de trading reçue: {json.dumps(trade_recommendation, indent=2)}")
+        # Mise en cache des structures détectées et de la dernière reco LLM
+        if 'last_structures' not in globals():
+            last_structures = None
+        if 'last_llm_rec' not in globals():
+            last_llm_rec = None
+        if 'solo_tech_mode' not in globals():
+            solo_tech_mode = False
+        
+        # Préparation du payload pour le nouveau module LLM si disponible
+        llm_payload = None
+        if use_new_llm_engine:
+            # Construction du payload pour llm_engine
+            llm_payload = {
+                "market_data": {},  # À remplir avec les données MT5 pour chaque paire
+                "ict_signals": structures_detected,  # Structures ICT détectées
+                "macro_events": calendar_data if 'calendar_data' in locals() else [],  # Événements macro
+                "history": {  # Historique des trades récents si disponible
+                    "last_trades": []  # À remplir avec l'historique réel
+                }
+            }
             
+            # Ajout des données de marché pour les paires majeures
+            FOREX_MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURCHF"]
+            for pair in FOREX_MAJORS:
+                try:
+                    # Récupérer les données actuelles depuis MT5
+                    current_price = mt5_client.get_current_price(pair)
+                    llm_payload["market_data"][pair] = {
+                        "current_price": current_price,
+                        "structure": "unknown"  # À enrichir avec l'analyse réelle
+                    }
+                except Exception as e:
+                    print(f"[BOT][LLM] Erreur lors de la récupération des données pour {pair}: {e}")
+        
+        # Décision LLM - Utilisation du nouveau module ou de l'ancien pipeline
+        if use_new_llm_engine and llm_payload:
+            try:
+                print("[BOT][LLM] Appel du nouveau moteur LLM via decide_trade()...")
+                trade_recommendation = decide_trade(llm_payload)
+                if trade_recommendation is None:
+                    print("[BOT][LLM] Pas de recommandation du nouveau moteur LLM, fallback technique")
+                    solo_tech_mode = True
+                else:
+                    print(f"[BOT][LLM] Nouveau moteur LLM a généré une recommandation: {trade_recommendation['symbol']} {trade_recommendation['direction']}")
+                    last_llm_rec = trade_recommendation
+                    last_structures = structures_detected
+            except Exception as e:
+                print(f"[BOT][LLM] Erreur lors de l'appel à decide_trade(): {e}")
+                trade_recommendation = None
+                solo_tech_mode = True
+        # Ancien pipeline LLM si le nouveau module n'est pas disponible
+        elif (structures_detected != last_structures) and not solo_tech_mode:
+            trade_recommendation = llm.generate_trade_recommendation(
+                macro_analysis=strategie_complete,
+                technical_analysis=f"Structures détectées: {structures_text}",
+                risk_status=risk_status
+            )
+            if trade_recommendation is None:
+                print("[BOT][LLM] Passage en mode solo-technique (fallback technique pur)")
+                solo_tech_mode = True
+            else:
+                last_llm_rec = trade_recommendation
+                last_structures = structures_detected
+        elif solo_tech_mode:
+            trade_recommendation = None
+        else:
+            trade_recommendation = last_llm_rec
+        # --- FIN NOUVEAU PIPELINE LLM ---
+        # Définition des paires Forex majeures à surveiller
+        FOREX_MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD", "EURCHF"]
+        import random  # Pour la sélection aléatoire de paires
+        
+        # Fallback technique si pas de reco LLM
+        if trade_recommendation is None:
+            print("[BOT][LLM] Aucune recommandation LLM, fallback technique pur.")
+            # Sélection aléatoire d'une paire Forex majeure pour le fallback
+            fallback_pair = random.choice(FOREX_MAJORS)
+            signal = {
+                "pair": fallback_pair,
+                "symbol": fallback_pair,  # Assurer la compatibilité
+                "side": "WAIT",
+                "strategy": "PULLBACK",
+                "confidence": 0.5,
+                "entry": current_price if 'current_price' in locals() else 0,
+                "direction": "FLAT",
+                "sl": 0,
+                "tp": 0,
+                "timeframe": "M15"
+            }
+        else:
             # Vérifier si la recommandation est valide via StrategySelector
             trade_validity = selector.should_trade_from_llm(trade_recommendation)
-            
             if trade_validity:
                 print(f"[BOT][LLM] La recommandation a passé la validation, exécution de l'ordre...")
-                
-                # Préparation du signal formaté pour l'OrderManager
+                if 'action' in trade_validity:
+                    trade_validity['side'] = trade_validity.pop('action')
                 signal = {
                     'pair': trade_validity.get('symbol', ''),
-                    'direction': trade_validity.get('side', ''),
+                    'symbol': trade_validity.get('symbol', ''),  # Assurer la compatibilité
+                    'side': trade_validity.get('side', ''),
                     'strategy': trade_validity.get('type', 'LLM_AUTO'),
                     'confidence': trade_validity.get('confidence', 0.75),
                     'reason': f"LLM: {trade_validity.get('reason', 'Recommandation automatique')}",
-                    'sl_pips': trade_recommendation.get('stop_loss', 30),  # Valeur par défaut si non spécifiée
-                    'tp_pips': trade_recommendation.get('take_profit', 60)  # Valeur par défaut si non spécifiée
+                    'sl': trade_validity.get('stop_loss', trade_recommendation.get('stop_loss', 30)),
+                    'tp': trade_validity.get('take_profit', trade_recommendation.get('take_profit', 60)),
+                    'timeframe': trade_validity.get('timeframe', trade_recommendation.get('timeframe', ''))
                 }
-                
-                # Exécution de l'ordre si en mode demo ou live
-                if cfg.get('BROKER', {}).get('mode', 'Simulation').lower() not in ['simulation', 'backtest']:
-                    try:
-                        result = order_manager.place_trade(signal, float(cfg['RISK']['risk_pct'])/100)
-                        log_bot_status(f"LLM Trade: Exécution automatique - {signal['pair']} {signal['direction']} via {signal['strategy']}")
-                        print(f"[BOT][LLM] Ordre placé avec succès: {result}")
-                    except Exception as e:
-                        print(f"[BOT][LLM][ERREUR] Placement d'ordre échoué: {e}")
-                        log_bot_status(f"LLM Trade: Erreur d'exécution - {signal['pair']} {signal['direction']} - {e}")
-                else:
-                    print(f"[BOT][LLM][SIMULATION] Ordre simulé: {json.dumps(signal, indent=2)}")
-                    log_bot_status(f"LLM Trade: SIMULATION - {signal['pair']} {signal['direction']} via {signal['strategy']}")
             else:
-                print(f"[BOT][LLM] La recommandation n'a pas passé la validation, aucun ordre placé")
-                log_bot_status(f"LLM Trade: Recommandation rejetée - Validation échouée")
+                print(f"[BOT][LLM] La recommandation LLM n'a pas passé la validation, fallback technique.")
+                # Sélection aléatoire d'une paire Forex majeure pour le fallback
+                fallback_pair = random.choice(FOREX_MAJORS)
+                signal = {
+                    "pair": fallback_pair,
+                    "symbol": fallback_pair,  # Assurer la compatibilité
+                    "side": "WAIT",
+                    "strategy": "PULLBACK",
+                    "confidence": 0.5,
+                    "entry": current_price if 'current_price' in locals() else 0,
+                    "direction": "FLAT",
+                    "sl": 0,
+                    "tp": 0,
+                    "timeframe": "M15"
+                }
+        # Si fallback technique sans signal réel, on skippe l'envoi d'ordre
+        if signal.get('side', '').upper() == 'WAIT':
+            print("[BOT][FALLBACK] Signal WAIT détecté, aucun ordre envoyé ce tour.")
+            log_bot_status(f"FALLBACK: Signal WAIT détecté, aucun ordre envoyé pour {signal.get('pair', '')}.")
+            continue
+        # Exécution de l'ordre si en mode demo ou live
+        if cfg.get('BROKER', {}).get('mode', 'Simulation').lower() not in ['simulation', 'backtest']:
+            try:
+                result = order_manager.place_trade(signal, float(cfg['RISK']['risk_pct'])/100)
+                # Unification des champs pour compatibilité
+                pair = signal.get('pair', signal.get('symbol', 'UNKNOWN'))
+                side = signal.get('side', signal.get('direction', 'UNKNOWN'))
+                log_bot_status(f"LLM Trade: Exécution automatique - {pair} {side} via {signal['strategy']}")
+                print(f"[BOT][LLM] Ordre placé avec succès: {result}")
+            except Exception as e:
+                print(f"[BOT][LLM][ERREUR] Placement d'ordre échoué: {str(e)}")
+                # Unification des champs pour compatibilité
+                pair = signal.get('pair', signal.get('symbol', 'UNKNOWN'))
+                side = signal.get('side', signal.get('direction', 'UNKNOWN'))
+                log_bot_status(f"LLM Trade: Erreur d'exécution - {pair} {side} - {str(e)}")
         else:
-            print(f"[BOT][LLM] Aucune recommandation de trading générée pour le contexte actuel")
-            log_bot_status("LLM Trade: Aucune recommandation générée")
-        last_llm_call = now
-    else:
-        print(f"[BOT] Pas d'appel LLM cette boucle (next in {(llm_interval - (now - last_llm_call).total_seconds()):.0f}s)")
-        strategie = state.get("llm_strategy", "[LLM] En attente de prochaine analyse...")
+            print(f"[BOT][LLM][SIMULATION] Ordre simulé: {json.dumps(signal, indent=2)}")
+            log_bot_status(f"LLM Trade: SIMULATION - {signal['pair']} {signal['direction']} via {signal['strategy']}")
 
     # Routage stratégie / génération signaux
     # Utiliser le tuple complet (stratégie, nom, biais) s'il est disponible

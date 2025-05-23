@@ -28,6 +28,18 @@ Ce document décrit la procédure pour revenir rapidement à la version stable d
    python main.py
    ```
 
+## Désinstallation des dépendances spécifiques
+
+Si vous avez besoin de revenir à la version précédente du bot (avant la refactorisation du module LLM), vous devrez désinstaller la dépendance `portalocker` qui a été ajoutée :
+
+```bash
+pip uninstall -y portalocker
+```
+
+## Désactivation du flag
+
+Assurez-vous que le flag `--use-llm-v1` est désactivé dans la configuration ou les arguments de ligne de commande.
+
 ## Vérification post-rollback
 
 Après avoir effectué le rollback, vérifiez que :

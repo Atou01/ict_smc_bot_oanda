@@ -1,0 +1,49 @@
+# =========================
+# TEMPLATE DE CONFIGURATION
+# =========================
+# Copiez ce fichier en config.yaml et adaptez-le à votre environnement.
+
+IBKR:
+  host: 127.0.0.1           # Adresse IP du gateway IBKR
+  port: 4002                # Port du gateway IBKR
+  clientId: 2               # ID client unique pour la session API
+  account: U1234567         # Numéro de compte IBKR
+  symbols:                  # Liste des symboles à trader
+    - EURUSD
+    - USDJPY
+    - GBPUSD
+
+TIMEFRAMES:
+  analysis: "H1"            # Timeframe pour l'analyse
+  exec: "M15"               # Timeframe pour l'exécution des trades
+
+LIVE: true                  # true = trading réel, false = backtest ou simulation
+
+MAX_DRAWDOWN: 5             # % max de drawdown global (sécurité supplémentaire)
+MAX_SLIPPAGE: 2             # Slippage max toléré (en pips)
+
+RISK:
+  capital: 10000            # Capital de référence (EUR/USD)
+  risk_pct: 1.0             # % du capital risqué par trade
+  max_drawdown_pct: 3.0     # % max de drawdown avant blocage automatique
+
+BROKER:
+  mode: Simulation          # Mode d'exécution : Simulation | Live | Backtest
+
+CALENDAR:
+  source: "forexfactory"    # Source du calendrier économique
+  timezone: "UTC"           # Fuseau horaire pour les événements
+
+DISCORD:
+  webhook_url: "https://discord.com/api/webhooks/xxx/yyy"  # URL du webhook Discord (optionnel)
+
+OPENAI:
+  # api_key: ${OPENAI_API_KEY}         # Clé API OpenAI pour le LLM (exemple, ne jamais committer de clé réelle)
+
+# =========================
+# AJOUTEZ D'AUTRES SECTIONS SI BESOIN
+# =========================
+# Exemple :
+# LOGGING:
+#   level: INFO
+#   file: bot.log

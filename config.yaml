@@ -1,25 +1,69 @@
+# =========================
+# TEMPLATE DE CONFIGURATION
+# =========================
+# Copiez ce fichier en config.yaml et adaptez-le à votre environnement.
+
 IBKR:
-  host: 127.0.0.1
-  port: 7497
-  clientId: 1
-  account: U1234567
-  symbols:
+  host: 127.0.0.1           # Adresse IP du gateway IBKR
+  port: 4002                # Port du gateway IBKR
+  clientId: 2               # ID client unique pour la session API
+  account: U1234567         # Numéro de compte IBKR
+  symbols:                  # Liste des symboles à trader
     - EURUSD
     - USDJPY
+    - GBPUSD
+
 TIMEFRAMES:
-  analysis: "H1"
-  exec: "1 min"
-LIVE: true
-MAX_DRAWDOWN: 5  # % max drawdown before halting live trading
-MAX_SLIPPAGE: 2  # max slippage in pips for live orders
-  - "EUR_USD"
-  - "GBP_USD"
-  - "USD_JPY"
-TIMEFRAMES:
-  analysis: "H1"
-  exec: "M15"
+  analysis: "H1"            # Timeframe pour l'analyse
+  exec: "M15"               # Timeframe pour l'exécution des trades
+
+LIVE: true                  # true = trading réel, false = backtest ou simulation
+
+MAX_DRAWDOWN: 5             # % max de drawdown global (sécurité supplémentaire)
+MAX_SLIPPAGE: 2             # Slippage max toléré (en pips)
+
 RISK:
-  risk_per_trade: 1  # % du capital par trade
+  capital: 10000            # Capital de référence (EUR/USD)
+  risk_pct: 1.0             # % du capital risqué par trade
+  max_drawdown_pct: 3.0     # % max de drawdown avant blocage automatique
+
+BROKER:
+  mode: Demo                # Mode d'exécution : Simulation | Demo | Live | Backtest
+
 CALENDAR:
-  source: "forexfactory"
-  timezone: "UTC"
+  source: "forexfactory"    # Source du calendrier économique
+  timezone: "UTC"           # Fuseau horaire pour les événements
+
+DISCORD:
+  # Webhook pour les alertes de sécurité (drawdown, blocage, erreurs critiques, activation/désactivation du bot)
+  security_webhook_url: ${DISCORD_SECURITY_WEBHOOK}  # Laisser vide pour désactiver
+  # Webhook pour les notifications générales (prises de position, stratégies, signaux, annonces importantes)
+  notif_webhook_url: ${DISCORD_NOTIF_WEBHOOK}        # Laisser vide pour désactiver
+  # (Optionnel, pour compatibilité ancienne version)
+  webhook_url: ${DISCORD_WEBHOOK}                    # Ancien champ unique ; sera utilisé si les deux autres ne sont pas définis
+
+discord_llm:
+  token: ${DISCORD_LLM_BOT_TOKEN}      # Jamais de token en dur !
+  channel_id: "1373644384058474556"    # À adapter si besoin
+  allowed_users: ["782584140780404747"]
+  # openai_api_key: ${OPENAI_API_KEY}  # <<– DÉSACTIVÉ : la clé doit venir du .env
+  gpt_model: "gpt-4"
+
+OPENAI:
+  # api_key: ${OPENAI_API_KEY}         # <<– DÉSACTIVÉ : la clé doit venir du .env
+  # Si tu veux passer la clé via YAML un jour, dé-commente la ligne ci-dessus
+  # ou crée une variable d’environnement OPENAI_API_KEY.
+
+XML_FEED_URL: "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+XML_UPDATE_INTERVAL: 1800                               # 30 min
+XML_FILTER_IMPACT: ["High", "Medium"]
+XML_FILTER_COUNTRIES: ["USD", "EUR", "GBP", "JPY"]
+XML_OUTPUT_FORMAT: "summary"
+
+# =========================
+# AJOUTEZ D'AUTRES SECTIONS SI BESOIN
+# =========================
+# Exemple :
+# LOGGING:
+#   level: INFO
+#   file: bot.log

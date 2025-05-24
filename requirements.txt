@@ -1,6 +1,7 @@
 openai
 python-dotenv
-MetaTrader5
+# MetaTrader5 n'est disponible que sur Windows
+MetaTrader5; sys_platform == "win32"
 pandas
 numpy
 requests
